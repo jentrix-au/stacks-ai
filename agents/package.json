@@ -1,0 +1,22 @@
+{
+  "name": "stacks-reference-agents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude Agent SDK reference agents for the Stacks MCP platform (P4.2). Standalone package — not part of the app's dependency tree.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "bug-triage": "tsx bug-triage.ts",
+    "crm-follow-up": "tsx crm-follow-up.ts",
+    "standup": "tsx standup.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.173",
+    "@openai/codex-sdk": "^0.139.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

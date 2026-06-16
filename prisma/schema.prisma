@@ -1,0 +1,895 @@
+// Stacks — Task Manager
+// Postgres data model. Fractional positions (Float) are used for cheap reorders.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Auth.js (PrismaAdapter) tables
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  image         String?
+  emailVerified DateTime?
+  // Per-user toggle for immediate notification emails (mention/assign).
+  notifyEmail   Boolean   @default(true)
+  // Instance admin. On a self-hosted (open-source) deployment the first user to
+  // sign in on a fresh database is flagged here (see src/server/auth/first-user.ts).
+  isAdmin       Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+
+  accounts             Account[]
+  sessions             Session[]
+  memberships          WorkspaceMember[]
+  invitationsSent      Invitation[]      @relation("InvitedBy")
+  createdTasks         Task[]            @relation("TaskCreator")
+  taskAssignments      TaskAssignee[]
+  comments             Comment[]
+  uploadedAttachments  Attachment[]
+  activities           Activity[]
+  apiTokens            ApiToken[]
+  createdContacts      Contact[]         @relation("ContactCreator")
+  createdTaskLinks     TaskLink[]        @relation("TaskLinkCreator")
+  createdWebhooks      Webhook[]         @relation("WebhookCreator")
+  oauthCodes           OAuthAuthCode[]     @relation("OAuthCodeUser")
+  oauthRefreshTokens   OAuthRefreshToken[] @relation("OAuthRefreshUser")
+  taskWatches          TaskWatcher[]
+  notifications        Notification[]
+  savedViews           SavedView[]         @relation("SavedViewCreator")
+  automationRules      AutomationRule[]    @relation("AutomationCreator")
+}
+
+// ---------------------------------------------------------------------------
+// Personal access tokens for MCP / API access
+// ---------------------------------------------------------------------------
+
+model ApiToken {
+  id          String    @id @default(cuid())
+  userId      String
+  name        String
+  tokenHash   String    @unique
+  tokenPrefix String
+  // Least-privilege scopes: "read" | "write" | "admin". Empty array = token
+  // created before scopes existed — treated as full access (grandfathered)
+  // until rotated; the tokens UI nags to rotate these.
+  scopes      String[]  @default([])
+  // Restrict the token to a single workspace. Null = all the user's
+  // workspaces. Cascade: a token scoped to a deleted workspace dies with it
+  // rather than silently widening to everything.
+  workspaceId String?
+  // Agent identity (P4.1): how this token's agent presents in the UI — the
+  // attribution badge on MCP-sourced activities/comments shows
+  // `emoji displayName` when set, falling back to 🤖 + the token name.
+  displayName String?
+  emoji       String?
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace       Workspace?          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  rateLimits      ApiTokenRateLimit[]
+  idempotencyKeys IdempotencyKey[]
+  usage           ApiTokenUsage[]
+
+  @@index([userId])
+  @@index([workspaceId])
+}
+
+model ApiTokenRateLimit {
+  tokenId     String
+  bucket      String
+  count       Int      @default(0)
+  windowStart DateTime @default(now())
+
+  token ApiToken @relation(fields: [tokenId], references: [id], onDelete: Cascade)
+
+  @@id([tokenId, bucket])
+}
+
+// Per-token daily usage rollup (P2.8): `requests` increments in the verify
+// path (next to the rate limit), `mutations` in safe() after a successful
+// write/admin tool call. Powers the usage column on /account/tokens.
+model ApiTokenUsage {
+  tokenId   String
+  day       DateTime @db.Date
+  requests  Int      @default(0)
+  mutations Int      @default(0)
+
+  token ApiToken @relation(fields: [tokenId], references: [id], onDelete: Cascade)
+
+  @@id([tokenId, day])
+}
+
+// Stripe-style idempotency for MCP create_*/bulk_* tools: replaying the same
+// (token, key) within the TTL returns the stored response; a different
+// request body under the same key is a CONFLICT. Expired rows are
+// overwritten on access and swept by cron (P3.6).
+model IdempotencyKey {
+  tokenId     String
+  key         String
+  requestHash String
+  response    Json
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  token ApiToken @relation(fields: [tokenId], references: [id], onDelete: Cascade)
+
+  @@id([tokenId, key])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Outbound webhooks (P2.6): HMAC-signed POSTs fanned out from emitBoardEvent
+// alongside Pusher. Deliveries persist for retry (cron, exponential backoff,
+// max 8 attempts) and audit.
+// ---------------------------------------------------------------------------
+
+enum WebhookDeliveryStatus {
+  PENDING // queued or awaiting retry (nextRetryAt set)
+  SUCCESS
+  FAILED // attempts exhausted
+}
+
+model Webhook {
+  id          String   @id @default(cuid())
+  workspaceId String
+  url         String
+  // HMAC-SHA256 signing secret (hex). Shown once at creation.
+  secret      String
+  // BoardEvent names to deliver; empty array = all events.
+  events      String[] @default([])
+  active      Boolean  @default(true)
+  // Consecutive exhausted deliveries; auto-disables the webhook at the
+  // threshold in src/lib/webhooks/deliver.ts. Reset on any success.
+  consecutiveFailures Int @default(0)
+  createdById String
+  createdAt   DateTime @default(now())
+
+  workspace  Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy  User              @relation("WebhookCreator", fields: [createdById], references: [id])
+  deliveries WebhookDelivery[]
+
+  @@index([workspaceId])
+}
+
+model WebhookDelivery {
+  id          String                @id @default(cuid())
+  webhookId   String
+  event       String
+  payload     Json
+  status      WebhookDeliveryStatus @default(PENDING)
+  attempts    Int                   @default(0)
+  nextRetryAt DateTime?
+  lastError   String?
+  deliveredAt DateTime?
+  createdAt   DateTime              @default(now())
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextRetryAt])
+  @@index([webhookId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// OAuth 2.1 authorization server (P2.7) — minimal AS so Claude.ai/ChatGPT
+// custom connectors can connect (they can't send static Bearer headers).
+// Access tokens are ApiToken rows with the `tmo_` prefix (same hashed
+// storage, scopes, workspace restriction, rate limits as PATs).
+// ---------------------------------------------------------------------------
+
+// CIMD client cache: client_id IS an https URL; its metadata document is
+// fetched (SSRF-guarded) and cached here.
+model OAuthClient {
+  id           String   @id @default(cuid())
+  clientId     String   @unique
+  name         String
+  redirectUris String[]
+  logoUri      String?
+  metadata     Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  authCodes     OAuthAuthCode[]
+  refreshTokens OAuthRefreshToken[]
+}
+
+model OAuthAuthCode {
+  id            String    @id @default(cuid())
+  codeHash      String    @unique // sha256 of the code — raw value never stored
+  clientDbId    String
+  userId        String
+  redirectUri   String // bound at authorize time; token exchange must match exactly
+  scopes        String[]
+  workspaceId   String?
+  codeChallenge String // PKCE S256 challenge (base64url, no padding)
+  expiresAt     DateTime // 10 minutes
+  consumedAt    DateTime? // single-use
+  createdAt     DateTime  @default(now())
+
+  client OAuthClient @relation(fields: [clientDbId], references: [id], onDelete: Cascade)
+  user   User        @relation("OAuthCodeUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+model OAuthRefreshToken {
+  id            String    @id @default(cuid())
+  tokenHash     String    @unique // sha256 of the tmr_ token
+  clientDbId    String
+  userId        String
+  scopes        String[]
+  workspaceId   String?
+  accessTokenId String? // current ApiToken — revoked on rotation
+  expiresAt     DateTime
+  rotatedAt     DateTime? // single-use: set when exchanged for a new pair
+  revokedAt     DateTime?
+  createdAt     DateTime  @default(now())
+
+  client OAuthClient @relation(fields: [clientDbId], references: [id], onDelete: Cascade)
+  user   User        @relation("OAuthRefreshUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Workspaces
+// ---------------------------------------------------------------------------
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+model Workspace {
+  id         String   @id @default(cuid())
+  name       String
+  slug       String   @unique
+  // Short uppercase prefix for human-readable task keys ("STK" in STK-123).
+  // Derived from the slug at creation (see taskPrefixFromSlug in src/lib/slug.ts).
+  taskPrefix String
+  createdAt  DateTime @default(now())
+
+  members         WorkspaceMember[]
+  boards          Board[]
+  invitations     Invitation[]
+  contacts        Contact[]
+  tasks           Task[]
+  counter         WorkspaceCounter?
+  apiTokens       ApiToken[]
+  webhooks        Webhook[]
+  notifications   Notification[]
+  automationRules AutomationRule[]
+}
+
+// Per-workspace monotonic counter backing Task.number. Incremented atomically
+// (single upsert with RETURNING) inside the createTask transaction.
+model WorkspaceCounter {
+  workspaceId    String @id
+  nextTaskNumber Int    @default(1)
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+}
+
+model WorkspaceMember {
+  id          String   @id @default(cuid())
+  userId      String
+  workspaceId String
+  role        Role     @default(MEMBER)
+  joinedAt    DateTime @default(now())
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workspaceId])
+  @@index([workspaceId])
+}
+
+model Invitation {
+  id          String   @id @default(cuid())
+  workspaceId String
+  email       String
+  role        Role     @default(MEMBER)
+  token       String   @unique
+  invitedById String
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy User      @relation("InvitedBy", fields: [invitedById], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+  @@index([email])
+}
+
+// ---------------------------------------------------------------------------
+// Boards / columns / tasks
+// ---------------------------------------------------------------------------
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum BoardKind {
+  TASKS    // default; generic kanban
+  CRM      // sales pipeline (Contact + Deal sidecar)
+  SUPPORT  // help desk (Customer + Ticket sidecar)
+  BUGS     // bug tracker (BugReport sidecar)
+  ROADMAP  // initiatives (Initiative sidecar + dependency graph)
+}
+
+model Board {
+  id          String    @id @default(cuid())
+  workspaceId String
+  name        String
+  slug        String
+  background  String?   // optional cover color/image
+  kind        BoardKind @default(TASKS)
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  columns         Column[]
+  labels          Label[]
+  savedViews      SavedView[]
+  automationRules AutomationRule[]
+
+  @@unique([workspaceId, slug])
+  @@index([workspaceId])
+}
+
+// Automations v1 (P3.7): template-built rules. trigger/conditions/actions
+// are Json validated by the Zod schemas in src/server/automations/schemas.ts
+// — see that file for the exact shapes. Executor runs post-commit in the ops
+// pipeline; automation-sourced events never re-trigger rules (loop guard).
+model AutomationRule {
+  id          String    @id @default(cuid())
+  workspaceId String
+  boardId     String?
+  name        String
+  enabled     Boolean   @default(true)
+  trigger     Json
+  conditions  Json
+  actions     Json
+  runCount    Int       @default(0)
+  lastRunAt   DateTime?
+  createdById String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  board     Board?    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  createdBy User      @relation("AutomationCreator", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+  @@index([boardId])
+}
+
+// Saved board views (P3.4): a named snapshot of the board-filter state
+// (labels/assignees/priorities/due + sort). `shared` views are visible to
+// every board member; private ones only to their creator.
+model SavedView {
+  id          String   @id @default(cuid())
+  boardId     String
+  name        String
+  filters     Json
+  shared      Boolean  @default(false)
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  board     Board @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  createdBy User  @relation("SavedViewCreator", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([boardId])
+}
+
+model Column {
+  id        String   @id @default(cuid())
+  boardId   String
+  name      String
+  position  Float
+  wipLimit  Int?
+  archivedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  board Board  @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  tasks Task[]
+
+  @@index([boardId, position])
+}
+
+model Task {
+  id          String    @id @default(cuid())
+  columnId    String
+  // Denormalized from column.board.workspaceId so cross-board queries don't
+  // have to join through Column/Board. Tasks never move across boards, so
+  // this is write-once.
+  workspaceId String
+  // Human-readable per-workspace sequence ("123" in STK-123), allocated from
+  // WorkspaceCounter inside the create transaction. Stable across moves.
+  number      Int
+  title       String
+  description String?   @db.Text
+  position    Float
+  priority    Priority  @default(MEDIUM)
+  dueAt       DateTime?
+  createdById String
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  // Generated FTS column (P3.1): setweight(title 'A') || setweight(description
+  // 'B'), GENERATED ALWAYS … STORED in the migration SQL — Prisma can't
+  // express generated columns, so it's declared Unsupported here.
+  searchVector Unsupported("tsvector")?
+  // Semantic embedding (P4.3, pgvector). Written by the cron sweep via raw
+  // SQL — Prisma can't read/write vector columns. embeddingHash is the md5
+  // (computed in SQL) of the embedded text; the sweep re-embeds rows whose
+  // stored hash no longer matches, so edits become eventually consistent.
+  embedding     Unsupported("vector(1024)")?
+  embeddingHash String?
+
+  column        Column         @relation(fields: [columnId], references: [id], onDelete: Cascade)
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy     User           @relation("TaskCreator", fields: [createdById], references: [id])
+  labels        TaskLabel[]
+  assignees     TaskAssignee[]
+  subtasks      Subtask[]
+  comments      Comment[]
+  attachments   Attachment[]
+  activities    Activity[]
+  deal          Deal?
+  bugReport     BugReport?
+  ticket        Ticket?
+  initiative    Initiative?
+  outgoingLinks TaskLink[]     @relation("TaskLinkFrom")
+  incomingLinks TaskLink[]     @relation("TaskLinkTo")
+  watchers      TaskWatcher[]
+  notifications Notification[]
+
+  @@unique([workspaceId, number])
+  @@index([columnId, position])
+  @@index([dueAt])
+  @@index([searchVector], type: Gin)
+  // Trigram index backing the ILIKE substring fallback in workspace search.
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin)
+}
+
+// ---------------------------------------------------------------------------
+// Universal task-link graph (subsumes InitiativeDependency). Edges connect
+// tasks of ANY board kind within one workspace. Directional: from → to.
+// BLOCKS / DEPENDS_ON participate in cycle detection
+// (src/server/links/graph.ts); RELATES_TO / DUPLICATES are exempt.
+// ---------------------------------------------------------------------------
+
+enum TaskLinkKind {
+  BLOCKS // from blocks to
+  DEPENDS_ON // from depends on to
+  RELATES_TO // bidirectional marker, no cycle semantics
+  DUPLICATES // from duplicates to
+}
+
+model TaskLink {
+  fromTaskId  String
+  toTaskId    String
+  kind        TaskLinkKind
+  createdById String
+  createdAt   DateTime     @default(now())
+
+  from      Task @relation("TaskLinkFrom", fields: [fromTaskId], references: [id], onDelete: Cascade)
+  to        Task @relation("TaskLinkTo", fields: [toTaskId], references: [id], onDelete: Cascade)
+  createdBy User @relation("TaskLinkCreator", fields: [createdById], references: [id])
+
+  @@id([fromTaskId, toTaskId, kind])
+  @@index([toTaskId])
+}
+
+model Label {
+  id       String      @id @default(cuid())
+  boardId  String
+  name     String
+  color    String      // hex like #ef4444 or token name
+  board    Board       @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  tasks    TaskLabel[]
+
+  @@unique([boardId, name])
+  @@index([boardId])
+}
+
+model TaskLabel {
+  taskId  String
+  labelId String
+
+  task  Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  label Label @relation(fields: [labelId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, labelId])
+  @@index([labelId])
+}
+
+model TaskAssignee {
+  taskId String
+  userId String
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, userId])
+  @@index([userId])
+}
+
+model Subtask {
+  id        String   @id @default(cuid())
+  taskId    String
+  title     String
+  completed Boolean  @default(false)
+  position  Float
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, position])
+}
+
+// ---------------------------------------------------------------------------
+// Comments + attachments + activity
+// ---------------------------------------------------------------------------
+
+model Comment {
+  id        String   @id @default(cuid())
+  taskId    String
+  authorId  String
+  body      String   @db.Text
+  // Mentioned user ids (P3.3): recorded by the editor's @autocomplete (or the
+  // MCP mentions param), validated as workspace members at write time.
+  mentions  String[] @default([])
+  editedAt  DateTime?
+  createdAt DateTime @default(now())
+  // Generated FTS column (P3.1) — comment text surfaces the parent task in
+  // workspace search. DDL lives in the migration SQL.
+  searchVector Unsupported("tsvector")?
+
+  task        Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author      User         @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  attachments Attachment[]
+
+  @@index([taskId, createdAt])
+  @@index([searchVector], type: Gin)
+}
+
+// ---------------------------------------------------------------------------
+// Watchers + notifications (P3.3). Auto-watch on create/assign/comment;
+// notify on assigned / mentioned / comment-on-watched (due-soon and SLA
+// breach join via the P3.6 cron sweep).
+// ---------------------------------------------------------------------------
+
+model TaskWatcher {
+  taskId    String
+  userId    String
+  createdAt DateTime @default(now())
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, userId])
+  @@index([userId])
+}
+
+model Notification {
+  id          String    @id @default(cuid())
+  userId      String
+  workspaceId String
+  taskId      String?
+  // Open string, not a DB enum (Postgres enums are append-only):
+  // "assigned" | "mentioned" | "commented" | "due_soon" | "sla_breached".
+  type        String
+  // Denormalized display snapshot: { actorName, taskKey, taskTitle,
+  // boardSlug, preview? } — notifications stay renderable after the
+  // underlying entities change.
+  payload     Json?
+  readAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  task      Task?     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+}
+
+enum AttachmentStatus {
+  PENDING
+  READY
+  FAILED
+}
+
+model Attachment {
+  id         String           @id @default(cuid())
+  taskId     String?
+  commentId  String?
+  uploaderId String
+  name       String
+  mimeType   String
+  size       Int
+  r2Key      String           @unique
+  width      Int?
+  height     Int?
+  status     AttachmentStatus @default(PENDING)
+  createdAt  DateTime         @default(now())
+
+  task     Task?    @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  comment  Comment? @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  uploader User     @relation(fields: [uploaderId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@index([commentId])
+  @@index([uploaderId])
+}
+
+enum ActivityType {
+  TASK_CREATED
+  TASK_UPDATED
+  TASK_MOVED
+  TASK_ARCHIVED
+  TASK_RESTORED
+  LABEL_ADDED
+  LABEL_REMOVED
+  ASSIGNEE_ADDED
+  ASSIGNEE_REMOVED
+  DUE_DATE_SET
+  DUE_DATE_CLEARED
+  PRIORITY_CHANGED
+  COMMENT_CREATED
+  COMMENT_EDITED
+  COMMENT_DELETED
+  ATTACHMENT_ADDED
+  ATTACHMENT_REMOVED
+  SUBTASK_ADDED
+  SUBTASK_COMPLETED
+  DEAL_UPDATED
+  CONTACT_LINKED
+  CONTACT_UNLINKED
+  BUG_UPDATED
+  BUG_RESOLVED
+  BUG_REOPENED
+  TICKET_UPDATED
+  CUSTOMER_LINKED
+  CUSTOMER_UNLINKED
+  INITIATIVE_UPDATED
+  DEPENDENCY_ADDED
+  DEPENDENCY_REMOVED
+  SLA_BREACHED
+  AUTOMATION_RAN
+}
+
+model Activity {
+  id        String       @id @default(cuid())
+  taskId    String
+  // Null = system-generated (P3.6 cron sweep, e.g. SLA_BREACHED). The UI
+  // renders these as "System".
+  actorId   String?
+  type      ActivityType
+  payload   Json?
+  createdAt DateTime     @default(now())
+
+  task  Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  actor User? @relation(fields: [actorId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Contacts (workspace-scoped) — the ONE party directory: CRM deals attach
+// many contacts (DealContact), SUPPORT tickets link one (Ticket.contactId).
+// Deal is the 1:1 sidecar rendered on kind=CRM boards.
+// ---------------------------------------------------------------------------
+
+model Contact {
+  id          String    @id @default(cuid())
+  workspaceId String
+  name        String
+  email       String?
+  phone       String?
+  company     String?
+  // External identifier (e.g. an external CRM / auth system id). Absorbed
+  // from Customer in the P1.3 party merge.
+  externalId  String?
+  createdById String
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  // Generated FTS column (P3.1): name+email (A) || company (B), 'simple'
+  // config (names must not be stemmed). DDL lives in the migration SQL.
+  searchVector Unsupported("tsvector")?
+  // Semantic embedding (P4.3) — see the Task model's embedding comment.
+  embedding     Unsupported("vector(1024)")?
+  embeddingHash String?
+
+  workspace Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy User          @relation("ContactCreator", fields: [createdById], references: [id])
+  deals     DealContact[]
+  tickets   Ticket[]
+
+  @@index([workspaceId])
+  @@index([workspaceId, email])
+  @@index([workspaceId, name])
+  @@index([searchVector], type: Gin)
+  // Trigram indexes backing the ILIKE substring fallback (partial emails etc).
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([email(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([company(ops: raw("gin_trgm_ops"))], type: Gin)
+}
+
+model Deal {
+  id              String    @id @default(cuid())
+  taskId          String    @unique
+  amount          Decimal?  @db.Decimal(15, 2) // money — never Float
+  currency        String?   @db.VarChar(3)     // ISO 4217 (USD, EUR, ...)
+  expectedCloseAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  task     Task          @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  contacts DealContact[]
+
+  @@index([expectedCloseAt])
+}
+
+// Many-to-many between Deal and Contact. Explicit so we can carry createdAt
+// for audit and avoid Prisma's implicit join table.
+model DealContact {
+  dealId    String
+  contactId String
+  createdAt DateTime @default(now())
+
+  deal    Deal    @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@id([dealId, contactId])
+  @@index([contactId])
+}
+
+// ---------------------------------------------------------------------------
+// BUGS: BugReport sidecar (1:1 with Task). Rendered only on kind=BUGS boards.
+// Pure sidecar — no workspace-scoped party model.
+// ---------------------------------------------------------------------------
+
+enum BugSeverity {
+  TRIVIAL
+  MINOR
+  MAJOR
+  CRITICAL
+  BLOCKER
+}
+
+model BugReport {
+  id               String       @id @default(cuid())
+  taskId           String       @unique
+  severity         BugSeverity?
+  reproSteps       String?      @db.Text
+  expectedBehavior String?      @db.Text
+  actualBehavior   String?      @db.Text
+  affectedVersion  String?
+  environment      String?
+  resolvedAt       DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// SUPPORT: Ticket sidecar, linked to the workspace Contact directory (the
+// single party table — Customer was merged into Contact in P1.3 and dropped
+// in the contract migration). Rendered only on kind=SUPPORT boards.
+// ---------------------------------------------------------------------------
+
+enum TicketSeverity {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+model Ticket {
+  id              String          @id @default(cuid())
+  taskId          String          @unique
+  contactId       String?
+  severity        TicketSeverity?
+  slaDueAt        DateTime?
+  firstResponseAt DateTime?
+  resolvedAt      DateTime?
+  source          String? // "email", "chat", "phone", "other"
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  task    Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  contact Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@index([contactId])
+  @@index([slaDueAt])
+}
+
+// ---------------------------------------------------------------------------
+// ROADMAP: Initiative sidecar (1:1 with Task). Rendered only on kind=ROADMAP
+// boards. Dependencies between initiatives use the universal TaskLink graph
+// (InitiativeDependency was migrated into TaskLink in P1.2 and dropped in
+// the contract migration).
+// ---------------------------------------------------------------------------
+
+enum InitiativeConfidence {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model Initiative {
+  id             String                @id @default(cuid())
+  taskId         String                @unique
+  targetQuarter  String?               // e.g. "2026-Q2"
+  confidence     InitiativeConfidence?
+  effortEstimate String?               // "S" / "M" / "L" / "XL", or hours
+  rice           Json?                 // optional RICE prioritization fields
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+}

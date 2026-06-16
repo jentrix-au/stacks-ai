@@ -1,0 +1,86 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`MCP result shapes (P2.2 acceptance) > read tool (list_tasks): text fallback + validated structuredContent 1`] = `
+{
+  "content": [
+    {
+      "text": "{"boardId":"board_1","boardName":"Sprint 12","boardKind":"TASKS","totalCount":2,"tasks":[{"id":"task_1","number":7,"key":"STK-7","title":"Fix login redirect","columnId":"col_1","columnName":"In progress","priority":"HIGH","dueAt":"2026-06-20T00:00:00.000Z","archivedAt":null},{"id":"task_2","number":8,"key":"STK-8","title":"Polish empty states","columnId":"col_2","columnName":"Todo","priority":"MEDIUM","dueAt":null,"archivedAt":null}],"nextCursor":null}",
+      "type": "text",
+    },
+  ],
+  "structuredContent": {
+    "boardId": "board_1",
+    "boardKind": "TASKS",
+    "boardName": "Sprint 12",
+    "nextCursor": null,
+    "tasks": [
+      {
+        "archivedAt": null,
+        "columnId": "col_1",
+        "columnName": "In progress",
+        "dueAt": "2026-06-20T00:00:00.000Z",
+        "id": "task_1",
+        "key": "STK-7",
+        "number": 7,
+        "priority": "HIGH",
+        "title": "Fix login redirect",
+      },
+      {
+        "archivedAt": null,
+        "columnId": "col_2",
+        "columnName": "Todo",
+        "dueAt": null,
+        "id": "task_2",
+        "key": "STK-8",
+        "number": 8,
+        "priority": "MEDIUM",
+        "title": "Polish empty states",
+      },
+    ],
+    "totalCount": 2,
+  },
+}
+`;
+
+exports[`MCP result shapes (P2.2 acceptance) > semantic tool (find_similar_tasks): similarity rows + disabled notice (P4.3) 1`] = `
+{
+  "content": [
+    {
+      "text": "{"tasks":[{"id":"task_3","number":11,"key":"STK-11","title":"Login redirect loops on Safari","columnName":"Triage","boardId":"board_2","boardName":"Bug tracker","boardSlug":"bugs","boardKind":"BUGS","similarity":0.8732}]}",
+      "type": "text",
+    },
+  ],
+  "structuredContent": {
+    "tasks": [
+      {
+        "boardId": "board_2",
+        "boardKind": "BUGS",
+        "boardName": "Bug tracker",
+        "boardSlug": "bugs",
+        "columnName": "Triage",
+        "id": "task_3",
+        "key": "STK-11",
+        "number": 11,
+        "similarity": 0.8732,
+        "title": "Login redirect loops on Safari",
+      },
+    ],
+  },
+}
+`;
+
+exports[`MCP result shapes (P2.2 acceptance) > write tool (create_task): returns id + number + semantic key 1`] = `
+{
+  "content": [
+    {
+      "text": "{"id":"task_9","number":42,"key":"STK-42"}",
+      "type": "text",
+    },
+  ],
+  "structuredContent": {
+    "id": "task_9",
+    "key": "STK-42",
+    "number": 42,
+  },
+}
+`;

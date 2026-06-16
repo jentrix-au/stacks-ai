@@ -1,0 +1,4 @@
+# Standalone package config (no sub-packages). esbuild's postinstall fetches
+# its platform binary — required by tsx.
+allowBuilds:
+  esbuild: true
